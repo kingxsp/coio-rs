@@ -16,7 +16,6 @@ num_cpus = "*"
 rand = "*"
 
 [dependencies]
-lazy_static = "^0.1.14"
 log = "^0.3.1"
 rand = "^0.3.10"
 chrono = "^0.2.15"
