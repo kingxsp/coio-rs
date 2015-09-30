@@ -128,48 +128,7 @@ impl Scheduler {
         }
     }
 
-    /// Run the scheduler with `n` threads
-    // pub fn run(n: usize) {
-        // assert!(n >= 1, "There must be at least 1 thread");
-        // Scheduler::instance().proc_handles.lock().unwrap().clear();
-        //
-        // fn do_work() {
-        //     {
-        //         let mut guard = Scheduler::instance().proc_handles.lock().unwrap();
-        //         Processor::current().set_neighbors(guard.iter().map(|x| x.1.clone()).collect());
-        //
-        //         let hdl = Processor::current().handle();
-        //         let stealer = Processor::current().stealer();
-        //         for neigh in guard.iter() {
-        //             let &(ref sender, _) = neigh;
-        //             if let Err(err) = sender.send(ProcMessage::NewNeighbor(stealer.clone())) {
-        //                 error!("Error while sending NewNeighbor {:?}", err);
-        //             }
-        //         }
-        //
-        //         guard.push((hdl, stealer));
-        //     }
-        //
-        //     match Processor::current().schedule() {
-        //         Ok(..) => {},
-        //         Err(err) => panic!("Processor schedule error: {:?}", err),
-        //     }
-        // }
-        //
-        // let mut futs = Vec::new();
-        // for _ in 1..n {
-        //     let fut = thread::spawn(do_work);
-        //
-        //     futs.push(fut);
-        // }
-        //
-        // do_work();
-        //
-        // for fut in futs.into_iter() {
-        //     fut.join().unwrap();
-        // }
-    // }
-
+    /// Run the scheduler
     pub fn run<M, R>(self, main_fn: M) -> Result<R, Box<Any + Send + 'static>>
         where M: FnOnce() -> R + Send + 'static,
               R: Send + 'static
