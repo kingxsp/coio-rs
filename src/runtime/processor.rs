@@ -32,13 +32,13 @@ use std::ptr;
 use std::any::Any;
 use std::time::Duration;
 
-use deque::{BufferPool, Stolen, Worker, Stealer};
-
 use rand;
 
 use scheduler::Scheduler;
 use coroutine::{self, Coroutine, State, Handle, SendableCoroutinePtr};
 use options::Options;
+
+use runtime::mpmc_bounded_queue::LockFreeQueue;
 
 thread_local!(static PROCESSOR: UnsafeCell<*mut Processor> = UnsafeCell::new(ptr::null_mut()));
 
@@ -54,9 +54,12 @@ pub struct Processor {
     last_result: Option<coroutine::Result<State>>,
     is_exiting: bool,
 
-    queue_worker: Worker<SendableCoroutinePtr>,
-    queue_stealer: Stealer<SendableCoroutinePtr>,
-    neighbor_stealers: Vec<Stealer<SendableCoroutinePtr>>,
+    // queue_worker: Worker<SendableCoroutinePtr>,
+    // queue_stealer: Stealer<SendableCoroutinePtr>,
+    // neighbor_stealers: Vec<Stealer<SendableCoroutinePtr>>,
+
+    queue: Arc<LockFreeQueue<SendableCoroutinePtr>>,
+    neighbor_stealers: Vec<Arc<LockFreeQueue<SendableCoroutinePtr>>>,
 
     chan_sender: Sender<ProcMessage>,
     chan_receiver: Receiver<ProcMessage>,
@@ -70,11 +73,12 @@ unsafe impl Send for Processor {}
 impl Processor {
     fn new_with_neighbors(_processor_id: usize,
                           sched: Arc<Scheduler>,
-                          neigh: Vec<Stealer<SendableCoroutinePtr>>)
+                          neigh: Vec<Arc<LockFreeQueue<SendableCoroutinePtr>>>)
+                        //   neigh: Vec<Stealer<SendableCoroutinePtr>>)
                           -> Processor {
         let main_coro = unsafe { Coroutine::empty() };
 
-        let (worker, stealer) = BufferPool::new().deque();
+        // let (worker, stealer) = BufferPool::new().deque();
         let (tx, rx) = mpsc::channel();
 
         Processor {
@@ -85,8 +89,11 @@ impl Processor {
             last_result: None,
             is_exiting: false,
 
-            queue_worker: worker,
-            queue_stealer: stealer,
+            // queue_worker: worker,
+            // queue_stealer: stealer,
+            // neighbor_stealers: neigh,
+
+            queue: Arc::new(LockFreeQueue::with_capacity(102400)),
             neighbor_stealers: neigh,
 
             chan_sender: tx,
@@ -100,10 +107,12 @@ impl Processor {
     #[inline]
     pub fn run_with_neighbors(processor_id: usize,
                               sched: Arc<Scheduler>,
-                              neigh: Vec<Stealer<SendableCoroutinePtr>>)
+                            //   neigh: Vec<Stealer<SendableCoroutinePtr>>)
+                              neigh: Vec<Arc<LockFreeQueue<SendableCoroutinePtr>>>)
                               -> (thread::JoinHandle<()>,
                                   Sender<ProcMessage>,
-                                  Stealer<SendableCoroutinePtr>) {
+                                  Arc<LockFreeQueue<SendableCoroutinePtr>>) {
+                                //   Stealer<SendableCoroutinePtr>) {
         let mut p = Processor::new_with_neighbors(processor_id, sched, neigh);
         let (msg, st) = (p.handle(), p.stealer());
         let hdl = Builder::new()
@@ -127,7 +136,8 @@ impl Processor {
                           f: M)
                           -> (thread::JoinHandle<()>,
                               Sender<ProcMessage>,
-                              Stealer<SendableCoroutinePtr>,
+                              Arc<LockFreeQueue<SendableCoroutinePtr>>,
+                            //   Stealer<SendableCoroutinePtr>,
                               ::std::sync::mpsc::Receiver<Result<T, Box<Any + Send + 'static>>>)
         where M: FnOnce() -> T + Send + 'static,
               T: Send + 'static
@@ -173,9 +183,19 @@ impl Processor {
         PROCESSOR.with(|p| unsafe { &mut **p.get() })
     }
 
+    // #[inline]
+    // pub fn stealer(&self) -> Stealer<SendableCoroutinePtr> {
+    //     self.queue_stealer.clone()
+    // }
+
     #[inline]
-    pub fn stealer(&self) -> Stealer<SendableCoroutinePtr> {
-        self.queue_stealer.clone()
+    pub fn stealer(&self) -> Arc<LockFreeQueue<SendableCoroutinePtr>> {
+        self.queue.clone()
+    }
+
+    #[inline]
+    pub fn pusher(&self) -> Arc<LockFreeQueue<SendableCoroutinePtr>> {
+        self.queue.clone()
     }
 
     #[inline]
@@ -185,9 +205,12 @@ impl Processor {
 
     #[inline]
     // Call by scheduler
-    pub unsafe fn ready(&mut self, coro_ptr: *mut Coroutine) {
+    pub unsafe fn ready(&mut self, mut coro_ptr: *mut Coroutine) {
         self.has_ready_tasks = true;
-        self.queue_worker.push(SendableCoroutinePtr(coro_ptr));
+        // self.queue_worker.push(SendableCoroutinePtr(coro_ptr));
+        while let Err(x) = self.queue.push(SendableCoroutinePtr(coro_ptr)) {
+            coro_ptr = x.0;
+        }
     }
 
     #[inline]
@@ -221,7 +244,8 @@ impl Processor {
             };
 
             // Try to fetch one task from the local queue
-            match self.queue_worker.pop() {
+            // match self.queue_worker.pop() {
+            match self.queue.pop() {
                 Some(h) => {
                     if is_suspended {
                         // If the current task has to be suspended, then
@@ -248,7 +272,8 @@ impl Processor {
 
         'outerloop: loop {
             // 1. Run all tasks in local queue
-            if let Some(hdl) = self.queue_worker.pop() {
+            // if let Some(hdl) = self.queue_worker.pop() {
+            if let Some(hdl) = self.queue.pop() {
                 unsafe {
                     self.run_with_all_local_tasks(hdl.0);
                 }
@@ -259,14 +284,16 @@ impl Processor {
             // 2. Check the mainbox
             while let Ok(msg) = self.chan_receiver.try_recv() {
                 match msg {
-                    ProcMessage::NewNeighbor(nei) => self.neighbor_stealers.push(nei),
+                    ProcMessage::NewNeighbor(nei) => {
+                        self.neighbor_stealers.push(nei)
+                    }
                     ProcMessage::Shutdown => {
                         self.destroy_all_coroutines();
                     }
-                    ProcMessage::Ready(SendableCoroutinePtr(ptr)) => unsafe {
-                        self.ready(ptr);
-                        self.has_ready_tasks = true;
-                    },
+                    // ProcMessage::Ready(SendableCoroutinePtr(ptr)) => unsafe {
+                    //     self.ready(ptr);
+                    //     self.has_ready_tasks = true;
+                    // },
                 }
             }
 
@@ -283,12 +310,18 @@ impl Processor {
             let rand_idx = rand::random::<usize>();
             let total_stealers = self.neighbor_stealers.len();
             for idx in (0..self.neighbor_stealers.len()).map(|x| (x + rand_idx) % total_stealers) {
-                if let Stolen::Data(SendableCoroutinePtr(hdl)) = self.neighbor_stealers[idx]
-                                                                     .steal() {
+                // if let Stolen::Data(SendableCoroutinePtr(hdl)) = self.neighbor_stealers[idx]
+                //                                                      .steal() {
+                //     unsafe {
+                //         self.run_with_all_local_tasks(hdl);
+                //     }
+                //     continue 'outerloop;
+                // }
+                if let Some(SendableCoroutinePtr(hdl)) = self.neighbor_stealers[idx].pop() {
                     unsafe {
                         self.run_with_all_local_tasks(hdl);
+                        continue 'outerloop;
                     }
-                    continue 'outerloop;
                 }
             }
 
@@ -305,7 +338,8 @@ impl Processor {
         self.is_exiting = true;
 
         // 1. Drain the work queue.
-        if let Some(hdl) = self.queue_worker.pop() {
+        // if let Some(hdl) = self.queue_worker.pop() {
+        if let Some(hdl) = self.queue.pop() {
             unsafe {
                 self.run_with_all_local_tasks(hdl.0);
             }
@@ -376,7 +410,8 @@ impl Processor {
 }
 
 pub enum ProcMessage {
-    NewNeighbor(Stealer<SendableCoroutinePtr>),
-    Ready(SendableCoroutinePtr),
+    // NewNeighbor(Stealer<SendableCoroutinePtr>),
+    NewNeighbor(Arc<LockFreeQueue<SendableCoroutinePtr>>),
+    // Ready(SendableCoroutinePtr),
     Shutdown,
 }

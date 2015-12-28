@@ -23,7 +23,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::sync::mpsc::{Sender, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 use std::default::Default;
 use std::any::Any;
 use std::io;
@@ -31,8 +31,6 @@ use std::cell::UnsafeCell;
 use std::time::Duration;
 use std::boxed::FnBox;
 use std::mem;
-
-use deque::Stealer;
 
 use mio::{EventLoop, Evented, Handler, Token, EventSet, PollOpt};
 use mio::util::Slab;
@@ -254,8 +252,8 @@ impl Scheduler {
         let the_sched = Arc::new(self);
         let mut handles = Vec::new();
 
-        let mut processor_handlers: Vec<Sender<ProcMessage>> = Vec::new();
-        let mut processor_stealers: Vec<Stealer<SendableCoroutinePtr>> = Vec::new();
+        let mut processor_handlers = Vec::new();
+        let mut processor_stealers = Vec::new();
 
         // Run the main function
         let main_coro_hdl = {
@@ -357,7 +355,7 @@ impl Scheduler {
 
         if let Some(ptr) = unsafe { processor.running() } {
             let event_loop: &mut EventLoop<IoHandler> = unsafe { &mut *self.eventloop.get() };
-            let proc_hdl = processor.handle();
+            let proc_hdl = processor.pusher();
             let sendable_coro = SendableCoroutinePtr(ptr);
             let channel = event_loop.channel();
 
@@ -378,8 +376,10 @@ impl Scheduler {
                                                       .unwrap();
                                             },
                                             move |evloop: &mut EventLoop<IoHandler>| {
-                                                proc_hdl.send(ProcMessage::Ready(sendable_coro))
-                                                        .unwrap();
+                                                let mut coro = sendable_coro;
+                                                while let Err(e) = proc_hdl.push(coro) {
+                                                    coro = e;
+                                                }
 
                                                 if cfg!(not(any(target_os = "macos",
                                                                 target_os = "ios",
@@ -405,7 +405,7 @@ impl Scheduler {
 
         if let Some(ptr) = unsafe { processor.running() } {
             let event_loop: &mut EventLoop<IoHandler> = unsafe { &mut *self.eventloop.get() };
-            let proc_hdl = processor.handle();
+            let proc_hdl = processor.pusher();
             let sendable_coro = SendableCoroutinePtr(ptr);
             let channel = event_loop.channel();
 
@@ -413,8 +413,10 @@ impl Scheduler {
                                                 evloop.timeout_ms(token, delay).unwrap();
                                             },
                                             move |_: &mut EventLoop<IoHandler>| {
-                                                proc_hdl.send(ProcMessage::Ready(sendable_coro))
-                                                        .unwrap();
+                                                let mut coro = sendable_coro;
+                                                while let Err(e) = proc_hdl.push(coro) {
+                                                    coro = e;
+                                                }
                                             });
             channel.send(msg).unwrap();
 

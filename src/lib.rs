@@ -28,7 +28,6 @@
 extern crate log;
 extern crate context;
 extern crate mio;
-extern crate deque;
 extern crate rand;
 extern crate libc;
 
