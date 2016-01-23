@@ -28,6 +28,9 @@ pub use self::unix::{UnixListener, UnixStream, UnixSocket};
 
 use std::io;
 use std::net::{ToSocketAddrs, SocketAddr};
+use std::fmt;
+
+use mio::Timeout;
 
 pub mod tcp;
 pub mod udp;
@@ -48,4 +51,26 @@ fn each_addr<A: ToSocketAddrs, F, T>(addr: A, mut f: F) -> io::Result<T>
         io::Error::new(io::ErrorKind::InvalidInput,
                        "could not resolve to any addresses")
     }))
+}
+
+struct IoTimeout {
+    pub delay: Option<u64>,
+    pub timeout: Option<Timeout>,
+}
+
+impl fmt::Debug for IoTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "IoTimeout {{ delay: {:?}, timeout: {}}}",
+               self.delay,
+               if self.timeout.is_some() { "Some(..)" } else { "None" })
+    }
+}
+
+impl IoTimeout {
+    fn new() -> IoTimeout {
+        IoTimeout {
+            delay: None,
+            timeout: None,
+        }
+    }
 }

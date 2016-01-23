@@ -26,29 +26,51 @@ use std::net::{ToSocketAddrs, SocketAddr};
 use std::ops::{Deref, DerefMut};
 use std::convert::From;
 use std::iter::Iterator;
+use std::cell::UnsafeCell;
+use std::fmt;
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 
-use mio::{self, EventSet};
+use mio::{self, EventSet, Timeout, Evented};
 
 use scheduler::Scheduler;
+use runtime::io::Io;
 
-#[derive(Debug)]
-pub struct TcpListener(::mio::tcp::TcpListener);
+use super::IoTimeout;
+
+pub struct TcpListener {
+    inner: ::mio::tcp::TcpListener,
+    timeout: UnsafeCell<IoTimeout>,
+}
+
+impl fmt::Debug for TcpListener {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "TcpListener {{ inner: {:?}, timeout: {:?} }}",
+               self.inner,
+               unsafe { &*self.timeout.get() })
+    }
+}
 
 impl TcpListener {
+    fn new(inner: ::mio::tcp::TcpListener) -> TcpListener {
+        TcpListener {
+            inner: inner,
+            timeout: UnsafeCell::new(IoTimeout::new()),
+        }
+    }
+
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<TcpListener> {
-        super::each_addr(addr, ::mio::tcp::TcpListener::bind).map(TcpListener)
+        super::each_addr(addr, ::mio::tcp::TcpListener::bind).map(TcpListener::new)
     }
 
     pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
-        match self.0.accept() {
+        match self.inner.accept() {
             Ok(None) => {
                 debug!("TcpListener accept WouldBlock; going to register into eventloop");
             }
             Ok(Some((stream, addr))) => {
-                return Ok((TcpStream(stream), addr));
+                return Ok((TcpStream::new(stream), addr));
             }
             Err(err) => {
                 return Err(err);
@@ -56,14 +78,14 @@ impl TcpListener {
         }
 
         loop {
-            try!(Scheduler::instance().unwrap().wait_event(&self.0, EventSet::readable()));
+            try!(Scheduler::instance().unwrap().wait_event(self, EventSet::readable()));
 
-            match self.0.accept() {
+            match self.inner.accept() {
                 Ok(None) => {
                     warn!("TcpListener accept WouldBlock; Coroutine was awaked by readable event");
                 }
                 Ok(Some((stream, addr))) => {
-                    return Ok((TcpStream(stream), addr));
+                    return Ok((TcpStream::new(stream), addr));
                 }
                 Err(err) => {
                     return Err(err);
@@ -73,7 +95,7 @@ impl TcpListener {
     }
 
     pub fn try_clone(&self) -> io::Result<TcpListener> {
-        Ok(TcpListener(try!(self.0.try_clone())))
+        Ok(TcpListener::new(try!(self.inner.try_clone())))
     }
 
     pub fn incoming<'a>(&'a self) -> Incoming<'a> {
@@ -85,27 +107,61 @@ impl Deref for TcpListener {
     type Target = ::mio::tcp::TcpListener;
 
     fn deref(&self) -> &::mio::tcp::TcpListener {
-        &self.0
+        &self.inner
     }
 }
 
 impl DerefMut for TcpListener {
     fn deref_mut(&mut self) -> &mut ::mio::tcp::TcpListener {
-        &mut self.0
+        &mut self.inner
+    }
+}
+
+impl Io for TcpListener {
+    fn evented(&self) -> &Evented {
+        &self.inner
+    }
+
+    fn set_timeout(&self, timeout: Option<u64>) {
+        unsafe {
+            let to = &mut *self.timeout.get();
+            to.delay = timeout;
+        }
+    }
+
+    fn timeout(&self) -> Option<u64> {
+        unsafe {
+            let to = &*self.timeout.get();
+            to.delay.clone()
+        }
+    }
+
+    fn save_timeout(&self, timeout: Timeout) {
+        unsafe {
+            let to = &mut *self.timeout.get();
+            to.timeout = Some(timeout);
+        }
+    }
+
+    fn take_timeout(&self) -> Option<Timeout> {
+        unsafe {
+            let timeout = &mut *self.timeout.get();
+            timeout.timeout.take()
+        }
     }
 }
 
 #[cfg(unix)]
 impl AsRawFd for TcpListener {
     fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
+        self.inner.as_raw_fd()
     }
 }
 
 #[cfg(unix)]
 impl FromRawFd for TcpListener {
     unsafe fn from_raw_fd(fd: RawFd) -> TcpListener {
-        TcpListener(FromRawFd::from_raw_fd(fd))
+        TcpListener::new(FromRawFd::from_raw_fd(fd))
     }
 }
 
@@ -140,34 +196,87 @@ impl From<Shutdown> for mio::tcp::Shutdown {
     }
 }
 
-#[derive(Debug)]
-pub struct TcpStream(mio::tcp::TcpStream);
+pub struct TcpStream {
+    inner: mio::tcp::TcpStream,
+    timeout: UnsafeCell<IoTimeout>,
+}
+
+impl fmt::Debug for TcpStream {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "TcpStream {{ inner: {:?}, timeout: {:?} }}",
+               self.inner,
+               unsafe { &*self.timeout.get() })
+    }
+}
+
+unsafe impl Send for TcpStream {}
 
 impl TcpStream {
+    fn new(inner: mio::tcp::TcpStream) -> TcpStream {
+        TcpStream {
+            inner: inner,
+            timeout: UnsafeCell::new(IoTimeout::new()),
+        }
+    }
+
     pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
-        super::each_addr(addr, ::mio::tcp::TcpStream::connect).map(TcpStream)
+        super::each_addr(addr, ::mio::tcp::TcpStream::connect).map(TcpStream::new)
     }
 
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.0.peer_addr()
+        self.inner.peer_addr()
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.0.local_addr()
+        self.inner.local_addr()
     }
 
     pub fn try_clone(&self) -> io::Result<TcpStream> {
-        let stream = try!(self.0.try_clone());
+        let stream = try!(self.inner.try_clone());
 
-        Ok(TcpStream(stream))
+        Ok(TcpStream::new(stream))
     }
 
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
-        self.0.shutdown(From::from(how))
+        self.inner.shutdown(From::from(how))
     }
 
     pub fn take_socket_error(&self) -> io::Result<()> {
-        self.0.take_socket_error()
+        self.inner.take_socket_error()
+    }
+}
+
+impl Io for TcpStream {
+    fn evented(&self) -> &Evented {
+        &self.inner
+    }
+
+    fn set_timeout(&self, timeout: Option<u64>) {
+        unsafe {
+            let to = &mut *self.timeout.get();
+            to.delay = timeout;
+        }
+    }
+
+    fn timeout(&self) -> Option<u64> {
+        unsafe {
+            let to = &*self.timeout.get();
+            to.delay.clone()
+        }
+    }
+
+    fn save_timeout(&self, timeout: Timeout) {
+        unsafe {
+            let to = &mut *self.timeout.get();
+            to.timeout = Some(timeout);
+        }
+    }
+
+    fn take_timeout(&self) -> Option<Timeout> {
+        unsafe {
+            let timeout = &mut *self.timeout.get();
+            timeout.timeout.take()
+        }
     }
 }
 
@@ -176,7 +285,7 @@ impl io::Read for TcpStream {
         use mio::TryRead;
 
         loop {
-            match self.0.try_read(buf) {
+            match self.inner.try_read(buf) {
                 Ok(None) => {
                     debug!("TcpStream read WouldBlock");
                     break;
@@ -188,7 +297,7 @@ impl io::Read for TcpStream {
                 Err(ref err) if err.kind() == ErrorKind::NotConnected => {
                     // If the socket is still still connecting, just register it into the loop
                     debug!("Read: Going to register event, socket is not connected");
-                    try!(Scheduler::instance().unwrap().wait_event(&self.0, EventSet::readable()));
+                    try!(Scheduler::instance().unwrap().wait_event(self, EventSet::readable()));
                     debug!("Read: Got read event");
                     try!(self.take_socket_error());
                 }
@@ -200,10 +309,10 @@ impl io::Read for TcpStream {
 
         loop {
             debug!("Read: Going to register event");
-            try!(Scheduler::instance().unwrap().wait_event(&self.0, EventSet::readable()));
+            try!(Scheduler::instance().unwrap().wait_event(self, EventSet::readable()));
             debug!("Read: Got read event");
 
-            match self.0.try_read(buf) {
+            match self.inner.try_read(buf) {
                 Ok(None) => {
                     debug!("TcpStream read WouldBlock");
                 }
@@ -224,7 +333,7 @@ impl io::Write for TcpStream {
         use mio::TryWrite;
 
         loop {
-            match self.0.try_write(buf) {
+            match self.inner.try_write(buf) {
                 Ok(None) => {
                     debug!("TcpStream write WouldBlock");
                     break;
@@ -236,7 +345,7 @@ impl io::Write for TcpStream {
                 Err(ref err) if err.kind() == ErrorKind::NotConnected => {
                     // If the socket is still still connecting, just register it into the loop
                     debug!("Write: Going to register event, socket is not connected");
-                    try!(Scheduler::instance().unwrap().wait_event(&self.0, EventSet::writable()));
+                    try!(Scheduler::instance().unwrap().wait_event(self, EventSet::writable()));
                     debug!("Write: Got write event");
                     try!(self.take_socket_error());
                 }
@@ -246,10 +355,10 @@ impl io::Write for TcpStream {
 
         loop {
             debug!("Write: Going to register event");
-            try!(Scheduler::instance().unwrap().wait_event(&self.0, EventSet::writable()));
+            try!(Scheduler::instance().unwrap().wait_event(self, EventSet::writable()));
             debug!("Write: Got write event");
 
-            match self.0.try_write(buf) {
+            match self.inner.try_write(buf) {
                 Ok(None) => {
                     debug!("TcpStream write WouldBlock");
                 }
@@ -263,7 +372,7 @@ impl io::Write for TcpStream {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        match self.0.flush() {
+        match self.inner.flush() {
             Ok(..) => return Ok(()),
             Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
                 debug!("TcpStream flush WouldBlock");
@@ -273,10 +382,10 @@ impl io::Write for TcpStream {
 
         loop {
             debug!("Write: Going to register event");
-            try!(Scheduler::instance().unwrap().wait_event(&self.0, EventSet::writable()));
+            try!(Scheduler::instance().unwrap().wait_event(self, EventSet::writable()));
             debug!("Write: Got write event");
 
-            match self.0.flush() {
+            match self.inner.flush() {
                 Ok(..) => return Ok(()),
                 Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
                     debug!("TcpStream flush WouldBlock");
@@ -291,26 +400,26 @@ impl Deref for TcpStream {
     type Target = ::mio::tcp::TcpStream;
 
     fn deref(&self) -> &::mio::tcp::TcpStream {
-        &self.0
+        &self.inner
     }
 }
 
 impl DerefMut for TcpStream {
     fn deref_mut(&mut self) -> &mut ::mio::tcp::TcpStream {
-        &mut self.0
+        &mut self.inner
     }
 }
 
 #[cfg(unix)]
 impl AsRawFd for TcpStream {
     fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
+        self.inner.as_raw_fd()
     }
 }
 
 #[cfg(unix)]
 impl FromRawFd for TcpStream {
     unsafe fn from_raw_fd(fd: RawFd) -> TcpStream {
-        TcpStream(FromRawFd::from_raw_fd(fd))
+        TcpStream::new(FromRawFd::from_raw_fd(fd))
     }
 }

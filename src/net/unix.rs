@@ -26,37 +26,59 @@ use std::path::Path;
 use std::ops::{Deref, DerefMut};
 use std::convert::From;
 use std::os::unix::io::{RawFd, AsRawFd, FromRawFd};
+use std::cell::UnsafeCell;
+use std::fmt;
 
-use mio::{TryRead, TryWrite, TryAccept, EventSet};
+use mio::{TryRead, TryWrite, TryAccept, EventSet, Evented, Timeout};
 
 use scheduler::Scheduler;
+use runtime::io::Io;
 
-#[derive(Debug)]
-pub struct UnixSocket(::mio::unix::UnixSocket);
+use super::IoTimeout;
+
+pub struct UnixSocket {
+    inner: ::mio::unix::UnixSocket,
+    timeout: UnsafeCell<IoTimeout>,
+}
+
+impl fmt::Debug for UnixSocket {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "UnixSocket {{ inner: {:?}, timeout: {:?} }}",
+               self.inner,
+               unsafe { &*self.timeout.get() })
+    }
+}
 
 impl UnixSocket {
+    fn new(inner: ::mio::unix::UnixSocket) -> UnixSocket {
+        UnixSocket {
+            inner: inner,
+            timeout: UnsafeCell::new(IoTimeout::new()),
+        }
+    }
+
     /// Returns a new, unbound, non-blocking Unix domain socket
     pub fn stream() -> io::Result<UnixSocket> {
-        ::mio::unix::UnixSocket::stream().map(UnixSocket)
+        ::mio::unix::UnixSocket::stream().map(UnixSocket::new)
     }
 
     /// Connect the socket to the specified address
     pub fn connect<P: AsRef<Path> + ?Sized>(self, addr: &P) -> io::Result<(UnixStream, bool)> {
-        self.0.connect(addr).map(|(s, completed)| (UnixStream(s), completed))
+        self.inner.connect(addr).map(|(s, completed)| (UnixStream::new(s), completed))
     }
 
     /// Bind the socket to the specified address
     pub fn bind<P: AsRef<Path> + ?Sized>(&self, addr: &P) -> io::Result<()> {
-        self.0.bind(addr)
+        self.inner.bind(addr)
     }
 
     /// Listen for incoming requests
     pub fn listen(self, backlog: usize) -> io::Result<UnixListener> {
-        self.0.listen(backlog).map(UnixListener)
+        self.inner.listen(backlog).map(UnixListener::new)
     }
 
     pub fn try_clone(&self) -> io::Result<UnixSocket> {
-        self.0.try_clone().map(UnixSocket)
+        self.inner.try_clone().map(UnixSocket::new)
     }
 }
 
@@ -64,50 +86,101 @@ impl Deref for UnixSocket {
     type Target = ::mio::unix::UnixSocket;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
 impl DerefMut for UnixSocket {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.inner
     }
 }
 
 impl From<::mio::unix::UnixSocket> for UnixSocket {
     fn from(sock: ::mio::unix::UnixSocket) -> UnixSocket {
-        UnixSocket(sock)
+        UnixSocket::new(sock)
     }
 }
 
 impl AsRawFd for UnixSocket {
     fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
+        self.inner.as_raw_fd()
     }
 }
 
 impl FromRawFd for UnixSocket {
     unsafe fn from_raw_fd(fd: RawFd) -> UnixSocket {
-        UnixSocket(FromRawFd::from_raw_fd(fd))
+        UnixSocket::new(FromRawFd::from_raw_fd(fd))
     }
 }
 
-#[derive(Debug)]
-pub struct UnixStream(::mio::unix::UnixStream);
+impl Io for UnixSocket {
+    fn evented(&self) -> &Evented {
+        &self.inner
+    }
+
+    fn set_timeout(&self, timeout: Option<u64>) {
+        unsafe {
+            let to = &mut *self.timeout.get();
+            to.delay = timeout;
+        }
+    }
+
+    fn timeout(&self) -> Option<u64> {
+        unsafe {
+            let to = &*self.timeout.get();
+            to.delay.clone()
+        }
+    }
+
+    fn save_timeout(&self, timeout: Timeout) {
+        unsafe {
+            let to = &mut *self.timeout.get();
+            to.timeout = Some(timeout);
+        }
+    }
+
+    fn take_timeout(&self) -> Option<Timeout> {
+        unsafe {
+            let timeout = &mut *self.timeout.get();
+            timeout.timeout.take()
+        }
+    }
+}
+
+pub struct UnixStream {
+    inner: ::mio::unix::UnixStream,
+    timeout: UnsafeCell<IoTimeout>,
+}
+
+impl fmt::Debug for UnixStream {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "UnixStream {{ inner: {:?}, timeout: {:?} }}",
+               self.inner,
+               unsafe { &*self.timeout.get() })
+    }
+}
 
 impl UnixStream {
+    fn new(inner: ::mio::unix::UnixStream) -> UnixStream {
+        UnixStream {
+            inner: inner,
+            timeout: UnsafeCell::new(IoTimeout::new()),
+        }
+    }
+
     pub fn connect<P: AsRef<Path> + ?Sized>(path: &P) -> io::Result<UnixStream> {
-        ::mio::unix::UnixStream::connect(path).map(UnixStream)
+        ::mio::unix::UnixStream::connect(path).map(UnixStream::new)
     }
 
     pub fn try_clone(&self) -> io::Result<UnixStream> {
-        self.0.try_clone().map(UnixStream)
+        self.inner.try_clone().map(UnixStream::new)
     }
 }
 
 impl Read for UnixStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.0.try_read(buf) {
+        match self.inner.try_read(buf) {
             Ok(None) => {
                 debug!("UnixStream read WouldBlock");
             }
@@ -123,10 +196,10 @@ impl Read for UnixStream {
 
         loop {
             debug!("Read: Going to register event");
-            try!(Scheduler::instance().unwrap().wait_event(&self.0, EventSet::readable()));
+            try!(Scheduler::instance().unwrap().wait_event(self, EventSet::readable()));
             debug!("Read: Got read event");
 
-            match self.0.try_read(buf) {
+            match self.inner.try_read(buf) {
                 Ok(None) => {
                     debug!("UnixStream read WouldBlock");
                 }
@@ -144,7 +217,7 @@ impl Read for UnixStream {
 
 impl Write for UnixStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self.0.try_write(buf) {
+        match self.inner.try_write(buf) {
             Ok(None) => {
                 debug!("UnixStream write WouldBlock");
             }
@@ -157,10 +230,10 @@ impl Write for UnixStream {
 
         loop {
             debug!("Write: Going to register event");
-            try!(Scheduler::instance().unwrap().wait_event(&self.0, EventSet::writable()));
+            try!(Scheduler::instance().unwrap().wait_event(self, EventSet::writable()));
             debug!("Write: Got write event");
 
-            match self.0.try_write(buf) {
+            match self.inner.try_write(buf) {
                 Ok(None) => {
                     debug!("UnixStream write WouldBlock");
                 }
@@ -174,7 +247,7 @@ impl Write for UnixStream {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        match self.0.flush() {
+        match self.inner.flush() {
             Ok(..) => return Ok(()),
             Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
                 debug!("UnixStream flush WouldBlock");
@@ -184,10 +257,10 @@ impl Write for UnixStream {
 
         loop {
             debug!("Write: Going to register event");
-            try!(Scheduler::instance().unwrap().wait_event(&self.0, EventSet::writable()));
+            try!(Scheduler::instance().unwrap().wait_event(self, EventSet::writable()));
             debug!("Write: Got write event");
 
-            match self.0.flush() {
+            match self.inner.flush() {
                 Ok(..) => return Ok(()),
                 Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
                     debug!("UnixStream flush WouldBlock");
@@ -202,49 +275,100 @@ impl Deref for UnixStream {
     type Target = ::mio::unix::UnixStream;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
 impl DerefMut for UnixStream {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.inner
     }
 }
 
 impl From<::mio::unix::UnixStream> for UnixStream {
     fn from(sock: ::mio::unix::UnixStream) -> UnixStream {
-        UnixStream(sock)
+        UnixStream::new(sock)
     }
 }
 
 impl AsRawFd for UnixStream {
     fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
+        self.inner.as_raw_fd()
     }
 }
 
 impl FromRawFd for UnixStream {
     unsafe fn from_raw_fd(fd: RawFd) -> UnixStream {
-        UnixStream(FromRawFd::from_raw_fd(fd))
+        UnixStream::new(FromRawFd::from_raw_fd(fd))
     }
 }
 
-#[derive(Debug)]
-pub struct UnixListener(::mio::unix::UnixListener);
+impl Io for UnixStream {
+    fn evented(&self) -> &Evented {
+        &self.inner
+    }
+
+    fn set_timeout(&self, timeout: Option<u64>) {
+        unsafe {
+            let to = &mut *self.timeout.get();
+            to.delay = timeout;
+        }
+    }
+
+    fn timeout(&self) -> Option<u64> {
+        unsafe {
+            let to = &*self.timeout.get();
+            to.delay.clone()
+        }
+    }
+
+    fn save_timeout(&self, timeout: Timeout) {
+        unsafe {
+            let to = &mut *self.timeout.get();
+            to.timeout = Some(timeout);
+        }
+    }
+
+    fn take_timeout(&self) -> Option<Timeout> {
+        unsafe {
+            let timeout = &mut *self.timeout.get();
+            timeout.timeout.take()
+        }
+    }
+}
+
+pub struct UnixListener {
+    inner: ::mio::unix::UnixListener,
+    timeout: UnsafeCell<IoTimeout>,
+}
+
+impl fmt::Debug for UnixListener {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "UnixListener {{ inner: {:?}, timeout: {:?} }}",
+               self.inner,
+               unsafe { &*self.timeout.get() })
+    }
+}
 
 impl UnixListener {
+    fn new(inner: ::mio::unix::UnixListener) -> UnixListener {
+        UnixListener {
+            inner: inner,
+            timeout: UnsafeCell::new(IoTimeout::new()),
+        }
+    }
+
     pub fn bind<P: AsRef<Path> + ?Sized>(addr: &P) -> io::Result<UnixListener> {
-        ::mio::unix::UnixListener::bind(addr).map(UnixListener)
+        ::mio::unix::UnixListener::bind(addr).map(UnixListener::new)
     }
 
     pub fn accept(&self) -> io::Result<UnixStream> {
-        match self.0.accept() {
+        match self.inner.accept() {
             Ok(None) => {
                 debug!("UnixListener accept WouldBlock; going to register into eventloop");
             }
             Ok(Some(stream)) => {
-                return Ok(UnixStream(stream));
+                return Ok(UnixStream::new(stream));
             }
             Err(err) => {
                 return Err(err);
@@ -252,14 +376,14 @@ impl UnixListener {
         }
 
         loop {
-            try!(Scheduler::instance().unwrap().wait_event(&self.0, EventSet::readable()));
+            try!(Scheduler::instance().unwrap().wait_event(self, EventSet::readable()));
 
-            match self.0.accept() {
+            match self.inner.accept() {
                 Ok(None) => {
                     warn!("UnixListener accept WouldBlock; Coroutine was awaked by readable event");
                 }
                 Ok(Some(stream)) => {
-                    return Ok(UnixStream(stream));
+                    return Ok(UnixStream::new(stream));
                 }
                 Err(err) => {
                     return Err(err);
@@ -269,7 +393,7 @@ impl UnixListener {
     }
 
     pub fn try_clone(&self) -> io::Result<UnixListener> {
-        self.0.try_clone().map(UnixListener)
+        self.inner.try_clone().map(UnixListener::new)
     }
 }
 
@@ -277,44 +401,97 @@ impl Deref for UnixListener {
     type Target = ::mio::unix::UnixListener;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
 impl DerefMut for UnixListener {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.inner
+    }
+}
+
+impl Io for UnixListener {
+    fn evented(&self) -> &Evented {
+        &self.inner
+    }
+
+    fn set_timeout(&self, timeout: Option<u64>) {
+        unsafe {
+            let to = &mut *self.timeout.get();
+            to.delay = timeout;
+        }
+    }
+
+    fn timeout(&self) -> Option<u64> {
+        unsafe {
+            let to = &*self.timeout.get();
+            to.delay.clone()
+        }
+    }
+
+    fn save_timeout(&self, timeout: Timeout) {
+        unsafe {
+            let to = &mut *self.timeout.get();
+            to.timeout = Some(timeout);
+        }
+    }
+
+    fn take_timeout(&self) -> Option<Timeout> {
+        unsafe {
+            let timeout = &mut *self.timeout.get();
+            timeout.timeout.take()
+        }
     }
 }
 
 impl From<::mio::unix::UnixListener> for UnixListener {
     fn from(listener: ::mio::unix::UnixListener) -> UnixListener {
-        UnixListener(listener)
+        UnixListener::new(listener)
     }
 }
 
 impl AsRawFd for UnixListener {
     fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
+        self.inner.as_raw_fd()
     }
 }
 
 impl FromRawFd for UnixListener {
     unsafe fn from_raw_fd(fd: RawFd) -> UnixListener {
-        UnixListener(FromRawFd::from_raw_fd(fd))
+        UnixListener::new(FromRawFd::from_raw_fd(fd))
     }
 }
 
 pub fn pipe() -> io::Result<(PipeReader, PipeWriter)> {
-    ::mio::unix::pipe().map(|(r, w)| (PipeReader(r), PipeWriter(w)))
+    ::mio::unix::pipe().map(|(r, w)| (PipeReader::new(r), PipeWriter::new(w)))
 }
 
-#[derive(Debug)]
-pub struct PipeReader(::mio::unix::PipeReader);
+pub struct PipeReader {
+    inner: ::mio::unix::PipeReader,
+    timeout: UnsafeCell<IoTimeout>,
+}
+
+impl fmt::Debug for PipeReader {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "PipeReader {{ inner: {:?}, timeout: {:?} }}",
+               self.inner,
+               unsafe { &*self.timeout.get() })
+    }
+}
+
+impl PipeReader {
+    fn new(inner: ::mio::unix::PipeReader) -> PipeReader {
+        PipeReader {
+            inner: inner,
+            timeout: UnsafeCell::new(IoTimeout::new()),
+        }
+    }
+}
 
 impl Read for PipeReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.0.try_read(buf) {
+        match self.inner.try_read(buf) {
             Ok(None) => {
                 debug!("PipeReader read WouldBlock");
             }
@@ -330,10 +507,10 @@ impl Read for PipeReader {
 
         loop {
             debug!("Read: Going to register event");
-            try!(Scheduler::instance().unwrap().wait_event(&self.0, EventSet::readable()));
+            try!(Scheduler::instance().unwrap().wait_event(self, EventSet::readable()));
             debug!("Read: Got read event");
 
-            match self.0.try_read(buf) {
+            match self.inner.try_read(buf) {
                 Ok(None) => {
                     debug!("PipeReader read WouldBlock");
                 }
@@ -353,40 +530,93 @@ impl Deref for PipeReader {
     type Target = ::mio::unix::PipeReader;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
 impl DerefMut for PipeReader {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.inner
+    }
+}
+
+impl Io for PipeReader {
+    fn evented(&self) -> &Evented {
+        &self.inner
+    }
+
+    fn set_timeout(&self, timeout: Option<u64>) {
+        unsafe {
+            let to = &mut *self.timeout.get();
+            to.delay = timeout;
+        }
+    }
+
+    fn timeout(&self) -> Option<u64> {
+        unsafe {
+            let to = &*self.timeout.get();
+            to.delay.clone()
+        }
+    }
+
+    fn save_timeout(&self, timeout: Timeout) {
+        unsafe {
+            let to = &mut *self.timeout.get();
+            to.timeout = Some(timeout);
+        }
+    }
+
+    fn take_timeout(&self) -> Option<Timeout> {
+        unsafe {
+            let timeout = &mut *self.timeout.get();
+            timeout.timeout.take()
+        }
     }
 }
 
 impl From<::mio::unix::PipeReader> for PipeReader {
     fn from(listener: ::mio::unix::PipeReader) -> PipeReader {
-        PipeReader(listener)
+        PipeReader::new(listener)
     }
 }
 
 impl AsRawFd for PipeReader {
     fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
+        self.inner.as_raw_fd()
     }
 }
 
 impl FromRawFd for PipeReader {
     unsafe fn from_raw_fd(fd: RawFd) -> PipeReader {
-        PipeReader(FromRawFd::from_raw_fd(fd))
+        PipeReader::new(FromRawFd::from_raw_fd(fd))
     }
 }
 
-#[derive(Debug)]
-pub struct PipeWriter(::mio::unix::PipeWriter);
+pub struct PipeWriter {
+    inner: ::mio::unix::PipeWriter,
+    timeout: UnsafeCell<IoTimeout>,
+}
+
+impl fmt::Debug for PipeWriter {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "PipeWriter {{ inner: {:?}, timeout: {:?} }}",
+               self.inner,
+               unsafe { &*self.timeout.get() })
+    }
+}
+
+impl PipeWriter {
+    fn new(inner: ::mio::unix::PipeWriter) -> PipeWriter {
+        PipeWriter {
+            inner: inner,
+            timeout: UnsafeCell::new(IoTimeout::new()),
+        }
+    }
+}
 
 impl Write for PipeWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self.0.try_write(buf) {
+        match self.inner.try_write(buf) {
             Ok(None) => {
                 debug!("PipeWriter write WouldBlock");
             }
@@ -399,10 +629,10 @@ impl Write for PipeWriter {
 
         loop {
             debug!("Write: Going to register event");
-            try!(Scheduler::instance().unwrap().wait_event(&self.0, EventSet::writable()));
+            try!(Scheduler::instance().unwrap().wait_event(self, EventSet::writable()));
             debug!("Write: Got write event");
 
-            match self.0.try_write(buf) {
+            match self.inner.try_write(buf) {
                 Ok(None) => {
                     debug!("PipeWriter write WouldBlock");
                 }
@@ -416,7 +646,7 @@ impl Write for PipeWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        match self.0.flush() {
+        match self.inner.flush() {
             Ok(..) => return Ok(()),
             Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
                 debug!("PipeWriter flush WouldBlock");
@@ -426,10 +656,10 @@ impl Write for PipeWriter {
 
         loop {
             debug!("Write: Going to register event");
-            try!(Scheduler::instance().unwrap().wait_event(&self.0, EventSet::writable()));
+            try!(Scheduler::instance().unwrap().wait_event(self, EventSet::writable()));
             debug!("Write: Got write event");
 
-            match self.0.flush() {
+            match self.inner.flush() {
                 Ok(..) => return Ok(()),
                 Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
                     debug!("PipeWriter flush WouldBlock");
@@ -444,30 +674,64 @@ impl Deref for PipeWriter {
     type Target = ::mio::unix::PipeWriter;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
 impl DerefMut for PipeWriter {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.inner
+    }
+}
+
+impl Io for PipeWriter {
+    fn evented(&self) -> &Evented {
+        &self.inner
+    }
+
+    fn set_timeout(&self, timeout: Option<u64>) {
+        unsafe {
+            let to = &mut *self.timeout.get();
+            to.delay = timeout;
+        }
+    }
+
+    fn timeout(&self) -> Option<u64> {
+        unsafe {
+            let to = &*self.timeout.get();
+            to.delay.clone()
+        }
+    }
+
+    fn save_timeout(&self, timeout: Timeout) {
+        unsafe {
+            let to = &mut *self.timeout.get();
+            to.timeout = Some(timeout);
+        }
+    }
+
+    fn take_timeout(&self) -> Option<Timeout> {
+        unsafe {
+            let timeout = &mut *self.timeout.get();
+            timeout.timeout.take()
+        }
     }
 }
 
 impl From<::mio::unix::PipeWriter> for PipeWriter {
     fn from(listener: ::mio::unix::PipeWriter) -> PipeWriter {
-        PipeWriter(listener)
+        PipeWriter::new(listener)
     }
 }
 
 impl AsRawFd for PipeWriter {
     fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
+        self.inner.as_raw_fd()
     }
 }
 
 impl FromRawFd for PipeWriter {
     unsafe fn from_raw_fd(fd: RawFd) -> PipeWriter {
-        PipeWriter(FromRawFd::from_raw_fd(fd))
+        PipeWriter::new(FromRawFd::from_raw_fd(fd))
     }
 }

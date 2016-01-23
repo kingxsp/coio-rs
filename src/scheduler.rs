@@ -34,6 +34,7 @@ use mio::{EventLoop, Evented, Handler, Token, EventSet, PollOpt};
 use mio::util::Slab;
 
 use runtime::processor::{Processor, ProcMessage};
+use runtime::io::Io;
 use coroutine::{SendableCoroutinePtr, Handle};
 use options::Options;
 
@@ -341,10 +342,10 @@ unsafe impl Sync for ResultWrapper {}
 impl Scheduler {
     /// Block the current coroutine and wait for I/O event
     #[doc(hidden)]
-    pub fn wait_event<'scope, E: Evented>(&self,
-                                          fd: &'scope E,
-                                          interest: EventSet)
-                                          -> io::Result<()> {
+    pub fn wait_event<'scope, E: Io>(&self,
+                                     fd: &'scope E,
+                                     interest: EventSet)
+                                     -> io::Result<()> {
         let mut ret = Ok(());
 
         Scheduler::take_current_coroutine(|coro| {
@@ -366,7 +367,7 @@ impl Scheduler {
             let reg = move |evloop: &mut EventLoop<IoHandler>, token| {
                 let fd = unsafe { &*fd1.0 };
                 let ret = unsafe { &mut *ret1.0 };
-                let r = evloop.register(fd, token, interest, PollOpt::edge() | PollOpt::oneshot());
+                let r = evloop.register(fd.evented(), token, interest, PollOpt::edge() | PollOpt::oneshot());
 
                 match r {
                     Ok(..) => true,
@@ -387,7 +388,7 @@ impl Scheduler {
                                 target_os = "netbsd"))) {
                     let fd = unsafe { &*fd2.0 };
                     let ret = unsafe { &mut *ret2.0 };
-                    *ret = evloop.deregister(fd);
+                    *ret = evloop.deregister(fd.evented());
                 }
 
                 proc_hdl2.send(ProcMessage::Ready(unsafe { Box::from_raw(coro2.0) })).unwrap();

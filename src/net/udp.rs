@@ -24,48 +24,71 @@
 use std::ops::{Deref, DerefMut};
 use std::io;
 use std::net::{ToSocketAddrs, SocketAddr};
+use std::cell::UnsafeCell;
+use std::fmt;
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 
-use mio::EventSet;
+use mio::{EventSet, Evented, Timeout};
 
 use scheduler::Scheduler;
+use runtime::io::Io;
 
-pub struct UdpSocket(::mio::udp::UdpSocket);
+use super::IoTimeout;
+
+pub struct UdpSocket {
+    inner: ::mio::udp::UdpSocket,
+    timeout: UnsafeCell<IoTimeout>,
+}
+
+impl fmt::Debug for UdpSocket {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "UdpSocket {{ inner: {:?}, timeout: {:?} }}",
+               self.inner,
+               unsafe { &*self.timeout.get() })
+    }
+}
 
 impl UdpSocket {
+    fn new(inner: ::mio::udp::UdpSocket) -> UdpSocket {
+        UdpSocket {
+            inner: inner,
+            timeout: UnsafeCell::new(IoTimeout::new()),
+        }
+    }
+
     /// Returns a new, unbound, non-blocking, IPv4 UDP socket
     pub fn v4() -> io::Result<UdpSocket> {
-        Ok(UdpSocket(try!(::mio::udp::UdpSocket::v4())))
+        Ok(UdpSocket::new(try!(::mio::udp::UdpSocket::v4())))
     }
 
     /// Returns a new, unbound, non-blocking, IPv6 UDP socket
     pub fn v6() -> io::Result<UdpSocket> {
-        Ok(UdpSocket(try!(::mio::udp::UdpSocket::v6())))
+        Ok(UdpSocket::new(try!(::mio::udp::UdpSocket::v6())))
     }
 
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
-        super::each_addr(addr, |a| ::mio::udp::UdpSocket::bound(&a)).map(UdpSocket)
+        super::each_addr(addr, |a| ::mio::udp::UdpSocket::bound(&a)).map(UdpSocket::new)
     }
 
     pub fn try_clone(&self) -> io::Result<UdpSocket> {
-        Ok(UdpSocket(try!(self.0.try_clone())))
+        Ok(UdpSocket::new(try!(self.inner.try_clone())))
     }
 
     pub fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], target: A) -> io::Result<usize> {
         let mut last_err = Ok(0);
         for addr in try!(target.to_socket_addrs()) {
-            match self.0.send_to(buf, &addr) {
+            match self.inner.send_to(buf, &addr) {
                 Ok(None) => {
                     debug!("UdpSocket send_to WOULDBLOCK");
 
                     loop {
                         try!(Scheduler::instance()
                                  .unwrap()
-                                 .wait_event(&self.0, EventSet::writable()));
+                                 .wait_event(self, EventSet::writable()));
 
-                        match self.0.send_to(buf, &addr) {
+                        match self.inner.send_to(buf, &addr) {
                             Ok(None) => {
                                 warn!("UdpSocket send_to WOULDBLOCK");
                             }
@@ -89,7 +112,7 @@ impl UdpSocket {
     }
 
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        match try!(self.0.recv_from(buf)) {
+        match try!(self.inner.recv_from(buf)) {
             None => {
                 debug!("UdpSocket recv_from WOULDBLOCK");
             }
@@ -99,9 +122,9 @@ impl UdpSocket {
         }
 
         loop {
-            try!(Scheduler::instance().unwrap().wait_event(&self.0, EventSet::readable()));
+            try!(Scheduler::instance().unwrap().wait_event(self, EventSet::readable()));
 
-            match try!(self.0.recv_from(buf)) {
+            match try!(self.inner.recv_from(buf)) {
                 None => {
                     warn!("UdpSocket recv_from WOULDBLOCK");
                 }
@@ -117,26 +140,60 @@ impl Deref for UdpSocket {
     type Target = ::mio::udp::UdpSocket;
 
     fn deref(&self) -> &::mio::udp::UdpSocket {
-        &self.0
+        &self.inner
     }
 }
 
 impl DerefMut for UdpSocket {
     fn deref_mut(&mut self) -> &mut ::mio::udp::UdpSocket {
-        &mut self.0
+        &mut self.inner
     }
 }
 
 #[cfg(unix)]
 impl AsRawFd for UdpSocket {
     fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
+        self.inner.as_raw_fd()
     }
 }
 
 #[cfg(unix)]
 impl FromRawFd for UdpSocket {
     unsafe fn from_raw_fd(fd: RawFd) -> UdpSocket {
-        UdpSocket(FromRawFd::from_raw_fd(fd))
+        UdpSocket::new(FromRawFd::from_raw_fd(fd))
+    }
+}
+
+impl Io for UdpSocket {
+    fn evented(&self) -> &Evented {
+        &self.inner
+    }
+
+    fn set_timeout(&self, timeout: Option<u64>) {
+        unsafe {
+            let to = &mut *self.timeout.get();
+            to.delay = timeout;
+        }
+    }
+
+    fn timeout(&self) -> Option<u64> {
+        unsafe {
+            let to = &*self.timeout.get();
+            to.delay.clone()
+        }
+    }
+
+    fn save_timeout(&self, timeout: Timeout) {
+        unsafe {
+            let to = &mut *self.timeout.get();
+            to.timeout = Some(timeout);
+        }
+    }
+
+    fn take_timeout(&self) -> Option<Timeout> {
+        unsafe {
+            let timeout = &mut *self.timeout.get();
+            timeout.timeout.take()
+        }
     }
 }
