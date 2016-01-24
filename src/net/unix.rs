@@ -32,7 +32,7 @@ use std::fmt;
 use mio::{TryRead, TryWrite, TryAccept, EventSet, Evented, Timeout};
 
 use scheduler::Scheduler;
-use runtime::io::Io;
+use io::Io;
 
 use super::IoTimeout;
 

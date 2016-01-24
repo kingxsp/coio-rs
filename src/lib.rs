@@ -45,6 +45,7 @@ pub mod sync;
 pub mod scheduler;
 pub mod options;
 pub mod promise;
+pub mod io;
 mod runtime;
 mod coroutine;
 

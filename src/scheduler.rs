@@ -34,7 +34,7 @@ use mio::{EventLoop, Evented, Handler, Token, EventSet, PollOpt};
 use mio::util::Slab;
 
 use runtime::processor::{Processor, ProcMessage};
-use runtime::io::Io;
+use io::Io;
 use coroutine::{SendableCoroutinePtr, Handle};
 use options::Options;
 
@@ -54,8 +54,13 @@ impl<T> JoinHandle<T> {
 
 unsafe impl<T: Send> Send for JoinHandle<T> {}
 
+struct IoHandlerCallbacks {
+    ready: ReadyCallback<'static>,
+    timedout: Option<ReadyCallback<'static>>,
+}
+
 struct IoHandler {
-    slab: Slab<Option<ReadyCallback<'static>>>,
+    slab: Slab<Option<IoHandlerCallbacks>>,
 }
 
 type RegisterCallback<'a> = Box<FnBox(&mut EventLoop<IoHandler>, Token) -> bool + Send + 'a>;
@@ -64,6 +69,7 @@ type ReadyCallback<'a> = Box<FnBox(&mut EventLoop<IoHandler>) + Send + 'a>;
 struct IoHandlerMessage {
     register: RegisterCallback<'static>,
     ready: ReadyCallback<'static>,
+    timeout: Option<(RegisterCallback<'static>, ReadyCallback<'static>)>,
 }
 
 impl IoHandlerMessage {
@@ -82,6 +88,39 @@ impl IoHandlerMessage {
         IoHandlerMessage {
             register: reg,
             ready: ready,
+            timeout: None,
+        }
+    }
+
+    fn new_timeout<'scope, Reg, Ready, TimedoutReg, Timedout>(reg: Reg, ready: Ready, timeout: Option<(TimedoutReg, Timedout)>) -> IoHandlerMessage
+        where Reg: FnOnce(&mut EventLoop<IoHandler>, Token) -> bool + Send + 'scope,
+              Ready: FnOnce(&mut EventLoop<IoHandler>) + Send + 'scope,
+              TimedoutReg: FnOnce(&mut EventLoop<IoHandler>, Token) -> bool + Send + 'scope,
+              Timedout: FnOnce(&mut EventLoop<IoHandler>) + Send + 'scope
+    {
+        let reg = unsafe {
+            mem::transmute::<RegisterCallback<'scope>, RegisterCallback<'static>>(Box::new(reg))
+        };
+
+        let ready = unsafe {
+            mem::transmute::<ReadyCallback<'scope>, ReadyCallback<'static>>(Box::new(ready))
+        };
+
+        let timeout = match timeout {
+            None => None,
+            Some((reg, timeout)) => Some((
+                unsafe {
+                    mem::transmute::<RegisterCallback<'scope>, RegisterCallback<'static>>(Box::new(reg))
+                },
+                unsafe {
+                    mem::transmute::<ReadyCallback<'scope>, ReadyCallback<'static>>(Box::new(timeout))
+                }))
+        };
+
+        IoHandlerMessage {
+            register: reg,
+            ready: ready,
+            timeout: timeout,
         }
     }
 }
@@ -101,7 +140,7 @@ impl Handler for IoHandler {
         }
 
         match self.slab.remove(token) {
-            Some(cb) => cb.unwrap().call_box((event_loop,)),
+            Some(cb) => cb.unwrap().ready.call_box((event_loop,)),
             None => {
                 warn!("No coroutine is waiting on token {:?}", token);
             }
@@ -117,7 +156,13 @@ impl Handler for IoHandler {
         }
 
         match self.slab.remove(token) {
-            Some(cb) => cb.unwrap().call_box((event_loop,)),
+            Some(cb) => {
+                let cb = cb.unwrap();
+                match cb.timedout {
+                    None => cb.ready.call_box((event_loop,)),
+                    Some(cb) => cb.call_box((event_loop,)),
+                }
+            }
             None => {
                 warn!("No coroutine is waiting on token {:?}", token);
             }
@@ -128,7 +173,22 @@ impl Handler for IoHandler {
         self.slab
             .insert_with(move |token| {
                 if msg.register.call_box((event_loop, token)) {
-                    Some(msg.ready)
+
+                    let timedout_cb = match msg.timeout {
+                        Some((timeout_reg, timeout)) => {
+                            if !timeout_reg.call_box((event_loop, token)) {
+                                None
+                            } else {
+                                Some(timeout)
+                            }
+                        }
+                        None => None
+                    };
+
+                    Some(IoHandlerCallbacks {
+                        ready: msg.ready,
+                        timedout: timedout_cb,
+                    })
                 } else {
                     None
                 }
@@ -144,7 +204,7 @@ impl IoHandler {
 
     fn wakeup_all(&mut self, event_loop: &mut EventLoop<Self>) {
         for cb in self.slab.iter_mut() {
-            cb.take().unwrap().call_box((event_loop,));
+            cb.take().unwrap().ready.call_box((event_loop,));
         }
 
         self.slab.clear();
@@ -357,44 +417,76 @@ impl Scheduler {
             unsafe impl<E> Send for EventedWrapper<E> {}
             unsafe impl<E> Sync for EventedWrapper<E> {}
 
-            let fd1 = EventedWrapper(fd);
-            let fd2 = EventedWrapper(fd);
-            let ret1 = ResultWrapper(&mut ret);
-            let ret2 = ResultWrapper(&mut ret);
             let coro1 = SendableCoroutinePtr(Box::into_raw(coro));
-            let coro2 = coro1;
 
-            let reg = move |evloop: &mut EventLoop<IoHandler>, token| {
-                let fd = unsafe { &*fd1.0 };
-                let ret = unsafe { &mut *ret1.0 };
-                let r = evloop.register(fd.evented(), token, interest, PollOpt::edge() | PollOpt::oneshot());
+            {
+                let fd1 = EventedWrapper(fd);
+                let fd2 = EventedWrapper(fd);
+                let ret1 = ResultWrapper(&mut ret);
+                let ret2 = ResultWrapper(&mut ret);
+                let ret3 = ResultWrapper(&mut ret);
+                let ret4 = ResultWrapper(&mut ret);
+                let coro2 = coro1;
 
-                match r {
-                    Ok(..) => true,
-                    Err(..) => {
-                        *ret = r;
-                        proc_hdl1.send(ProcMessage::Ready(unsafe { Box::from_raw(coro1.0) }))
-                                 .unwrap();
-                        false
+                let timeout = match fd.timeout() {
+                    None => None,
+                    Some(delay) => {
+                        let proc_hdl3 = proc_hdl1.clone();
+
+                        let reg = move|evloop: &mut EventLoop<IoHandler>, token| {
+                            let ret = unsafe { &mut *ret3.0 };
+
+                            match evloop.timeout_ms(token, delay) {
+                                Ok(..) => true,
+                                Err(..) => {
+                                    *ret = Err(io::Error::new(io::ErrorKind::Other, "failed to add timer"));
+                                    false
+                                }
+                            }
+                        };
+
+                        let ready = move |_: &mut EventLoop<IoHandler>| {
+                            let ret = unsafe { &mut *ret4.0 };
+                            *ret = Err(io::Error::new(io::ErrorKind::TimedOut, "Timed out"));
+                            proc_hdl3.send(ProcMessage::Ready(unsafe { Box::from_raw(coro1.0) })).unwrap();
+                        };
+
+                        Some((reg, ready))
                     }
-                }
-            };
+                };
 
-            let ready = move |evloop: &mut EventLoop<IoHandler>| {
-                if cfg!(not(any(target_os = "macos",
-                                target_os = "ios",
-                                target_os = "freebsd",
-                                target_os = "dragonfly",
-                                target_os = "netbsd"))) {
-                    let fd = unsafe { &*fd2.0 };
-                    let ret = unsafe { &mut *ret2.0 };
-                    *ret = evloop.deregister(fd.evented());
-                }
+                let reg = move |evloop: &mut EventLoop<IoHandler>, token| {
+                    let fd = unsafe { &*fd1.0 };
+                    let ret = unsafe { &mut *ret1.0 };
+                    let r = evloop.register(fd.evented(), token, interest, PollOpt::edge() | PollOpt::oneshot());
 
-                proc_hdl2.send(ProcMessage::Ready(unsafe { Box::from_raw(coro2.0) })).unwrap();
-            };
+                    match r {
+                        Ok(..) => true,
+                        Err(..) => {
+                            *ret = r;
+                            proc_hdl1.send(ProcMessage::Ready(unsafe { Box::from_raw(coro1.0) }))
+                                     .unwrap();
+                            false
+                        }
+                    }
+                };
 
-            channel.send(IoHandlerMessage::new(reg, ready)).unwrap();
+                let ready = move |evloop: &mut EventLoop<IoHandler>| {
+                    if cfg!(not(any(target_os = "macos",
+                                    target_os = "ios",
+                                    target_os = "freebsd",
+                                    target_os = "dragonfly",
+                                    target_os = "netbsd"))) {
+                        let fd = unsafe { &*fd2.0 };
+                        let ret = unsafe { &mut *ret2.0 };
+                        *ret = evloop.deregister(fd.evented());
+                    }
+
+                    proc_hdl2.send(ProcMessage::Ready(unsafe { Box::from_raw(coro2.0) })).unwrap();
+                };
+
+                channel.send(IoHandlerMessage::new_timeout(reg, ready, timeout)).unwrap();
+            }
         });
 
         ret

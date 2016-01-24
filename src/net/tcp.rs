@@ -35,7 +35,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use mio::{self, EventSet, Timeout, Evented};
 
 use scheduler::Scheduler;
-use runtime::io::Io;
+use io::Io;
 
 use super::IoTimeout;
 

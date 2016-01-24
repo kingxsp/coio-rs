@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 
 use coio::Scheduler;
 use coio::net::{TcpListener, TcpStream, UdpSocket, Shutdown};
+use coio::io::Io;
 
 #[cfg(unix)]
 use coio::net::{UnixStream, UnixListener};
@@ -47,6 +48,26 @@ fn test_tcp_echo() {
 
             listen_fut.join().unwrap();
             sender_fut.join().unwrap();
+        })
+        .unwrap();
+
+}
+
+#[test]
+fn test_tcp_echo_timedout() {
+
+    Scheduler::new()
+        .run(move || {
+            // Listener
+            let listen_fut = Scheduler::spawn(move || {
+                let acceptor = TcpListener::bind("127.0.0.1:7000").unwrap();
+                acceptor.set_timeout(Some(100));
+                if let Ok(..) = acceptor.accept() {
+                    panic!("Accept should be timedout, but it returns!!");
+                }
+            });
+
+            listen_fut.join().unwrap();
         })
         .unwrap();
 
