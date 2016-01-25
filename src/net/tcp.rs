@@ -166,6 +166,10 @@ impl TcpStream {
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         self.0.shutdown(From::from(how))
     } 
+
+    fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        TcpStreamExt::set_read_timeout_ms(&self, dur.map(dur2ms))
+    }
 }
 
 impl io::Read for TcpStream {
