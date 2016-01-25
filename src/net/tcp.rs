@@ -168,7 +168,7 @@ impl TcpStream {
     } 
 
     fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
-        TcpStreamExt::set_read_timeout_ms(&self, dur.map(dur2ms))
+        TcpStreamExt::set_read_timeout(&self, dur)
     }
 }
 
