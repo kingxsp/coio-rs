@@ -26,6 +26,8 @@ use std::net::{ToSocketAddrs, SocketAddr};
 use std::ops::{Deref, DerefMut};
 use std::convert::From;
 use std::iter::Iterator;
+use time::Duration;
+use net2::TcpStreamExt;
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
@@ -164,11 +166,7 @@ impl TcpStream {
 
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         self.0.shutdown(From::from(how))
-    }
-
-    pub fn take_socket_error(&self) -> io::Result<()> {
-        self.0.take_socket_error()
-    }
+    } 
 }
 
 impl io::Read for TcpStream {
