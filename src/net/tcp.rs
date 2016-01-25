@@ -26,7 +26,6 @@ use std::net::{ToSocketAddrs, SocketAddr};
 use std::ops::{Deref, DerefMut};
 use std::convert::From;
 use std::iter::Iterator;
-use time::Duration;
 use net2::TcpStreamExt;
 
 #[cfg(unix)]
